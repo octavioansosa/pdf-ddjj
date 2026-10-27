@@ -1,0 +1,769 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>HSE · Ficha de ingreso / DDJJ de salud</title>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+
+<style>
+  *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+  body{background:#0f1117;color:#e8eaf0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+       min-height:100vh;display:flex;align-items:center;justify-content:center}
+  .panel{text-align:center;padding:48px 32px;max-width:400px;width:100%}
+  .sp-wrap{width:52px;height:52px;margin:0 auto 28px;position:relative}
+  .sp{width:100%;height:100%;border:3px solid #1e2235;border-top-color:#010066;border-radius:50%;
+      animation:spin .85s linear infinite}
+  .sp.done{border-color:#2ecc71;border-top-color:#2ecc71;animation:none}
+  .sp.error{border-color:#e74c3c;border-top-color:#e74c3c;animation:none}
+  .sp.auth{border-color:#f58321;border-top-color:#f58321}
+  .ic{position:absolute;inset:0;display:none;align-items:center;justify-content:center;font-size:20px}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  h1{font-size:18px;font-weight:600;margin-bottom:8px;color:#f1f5f9}
+  .sub{font-size:13px;color:#64748b;line-height:1.6;white-space:pre-line}
+  .bar-wrap{margin-top:24px;background:#1e2235;border-radius:100px;height:3px;overflow:hidden}
+  .bar{height:100%;width:0;background:linear-gradient(90deg,#010066,#1f6f43);border-radius:100px;
+       transition:width .5s ease}
+  .step{margin-top:14px;font-size:11px;color:#334155;font-family:'Courier New',monospace;min-height:14px}
+  .err{display:none;margin-top:20px;background:#1c0a0a;border:1px solid #7f1d1d;border-radius:6px;
+       padding:12px 14px;font-size:12px;color:#fca5a5;text-align:left;line-height:1.7;white-space:pre-wrap}
+  .btn{display:none;margin-top:14px;padding:9px 22px;border:none;border-radius:6px;font-size:13px;
+       font-weight:600;cursor:pointer;background:#010066;color:#fff}
+  .btn:hover{opacity:.85}
+  #stage{position:fixed;left:-99999px;top:0;background:#fff}
+</style>
+</head>
+<body>
+
+<div class="panel">
+  <div class="sp-wrap"><div class="sp" id="sp"></div><div class="ic" id="ic"></div></div>
+  <h1  id="ttl">Iniciando…</h1>
+  <p   id="subt" class="sub">Verificando sesión.</p>
+  <div class="bar-wrap"><div class="bar" id="bar"></div></div>
+  <div class="step" id="log"></div>
+  <div class="err"  id="errbox"></div>
+  <button class="btn" id="btn-retry" onclick="location.reload()">Reintentar</button>
+</div>
+
+<div id="stage"></div>
+
+<script>
+/* ═══════════════════════════════════════════════════════════════
+   CONFIGURACIÓN
+   ═══════════════════════════════════════════════════════════════ */
+const CFG = {
+  clientId:        "PiXdJSAHwlLbNnsm",
+  portalUrl:       "https://niderasolutions.com/portal",
+
+  /* Capa: se resuelve sola a partir del ID del ítem del portal.
+     Si preferís fijarla a mano, completá featureLayerUrl con la URL
+     terminada en /FeatureServer/N y se ignoran itemId y layerIndex. */
+  itemId:          "b6df8f6d2df74faaa6bff757e9545ab2",
+  layerIndex:      0,
+  featureLayerUrl: "",
+
+  logoUrl:         "https://live.staticflickr.com/65535/49502017823_2dfc084f12_o.png",
+
+  headerTitle:     "HSE · Ficha personal de ingreso / Declaración jurada de salud",
+  headerBg:        "#010066",
+
+  incluirAdjuntos: true,
+  maxAdjuntos:     12,
+};
+
+const OAUTH_URL = CFG.portalUrl + "/sharing/rest/oauth2/authorize";
+const REDIRECT  = location.href.split("?")[0].split("#")[0];
+
+/* Geometría A4 */
+const PAGE_W_MM = 210, PAGE_H_MM = 297;
+const MARGIN_MM = 12;
+const CONTENT_W_MM = PAGE_W_MM - MARGIN_MM * 2;
+const CONTENT_H_MM = PAGE_H_MM - MARGIN_MM * 2 - 8;
+const STAGE_W_PX = 700;
+const PX_PER_MM  = STAGE_W_PX / CONTENT_W_MM;
+const MAX_PAGE_PX = CONTENT_H_MM * PX_PER_MM;
+
+/* ═══════════════════════════════════════════════════════════════
+   UI
+   ═══════════════════════════════════════════════════════════════ */
+const $ = id => document.getElementById(id);
+const prog  = p => $("bar").style.width = p + "%";
+const step  = m => $("log").textContent = m;
+const title = (t,s) => { $("ttl").textContent = t; if (s!==undefined) $("subt").textContent = s; };
+
+function icon(c){ const e=$("ic"); e.textContent=c; e.style.display="flex"; }
+function done(){ $("sp").className="sp done"; icon("✓"); prog(100); step("");
+  title("Informe descargado","El PDF se guardó en tu carpeta de descargas."); }
+function fail(m){ $("sp").className="sp error"; icon("✕"); prog(100); $("bar").style.background="#e74c3c";
+  title("No se pudo generar el informe",""); step("");
+  $("errbox").style.display="block"; $("errbox").textContent=m;
+  $("btn-retry").style.display="inline-block"; }
+const sleep = ms => new Promise(r=>setTimeout(r,ms));
+
+/* ═══════════════════════════════════════════════════════════════
+   OAUTH
+   ═══════════════════════════════════════════════════════════════ */
+function getToken(){
+  const raw = sessionStorage.getItem("agol_tk");
+  if(!raw) return null;
+  const {tk,exp} = JSON.parse(raw);
+  if(Date.now() > exp){ sessionStorage.removeItem("agol_tk"); return null; }
+  return tk;
+}
+function saveToken(tk,inSec){
+  sessionStorage.setItem("agol_tk", JSON.stringify({tk, exp: Date.now()+(inSec-60)*1000}));
+}
+function doLogin(){
+  const oid = new URLSearchParams(location.search).get("objectId")
+           || new URLSearchParams(location.search).get("objectid");
+  if(oid) sessionStorage.setItem("pending_oid", oid);
+  location.href = OAUTH_URL
+    + "?client_id="    + encodeURIComponent(CFG.clientId)
+    + "&response_type=token&expiration=20160"
+    + "&redirect_uri=" + encodeURIComponent(REDIRECT);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   CAPA: URL + METADATOS (dominios, fechas, nombres reales)
+   ═══════════════════════════════════════════════════════════════ */
+async function getJson(url){
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`HTTP ${r.status} al consultar ${url.split("?")[0]}`);
+  const d = await r.json();
+  if (d.error){
+    if (d.error.code === 498 || d.error.code === 499){
+      sessionStorage.removeItem("agol_tk");
+      throw new Error("El token expiró. Recargá la página para autenticarte de nuevo.");
+    }
+    throw new Error(d.error.message || JSON.stringify(d.error));
+  }
+  return d;
+}
+
+async function resolverUrlCapa(token){
+  if (CFG.featureLayerUrl) return CFG.featureLayerUrl.replace(/\/+$/,"");
+  const item = await getJson(CFG.portalUrl + "/sharing/rest/content/items/" + CFG.itemId
+                             + "?f=json&token=" + encodeURIComponent(token));
+  if (!item.url)
+    throw new Error("El ítem " + CFG.itemId + " no tiene URL de servicio (¿es un formulario y no la capa?).\n"
+                  + "Completá CFG.featureLayerUrl con la URL terminada en /FeatureServer/N.");
+  const u = item.url.replace(/\/+$/,"");
+  return /\/(FeatureServer|MapServer)\/\d+$/i.test(u) ? u : u + "/" + CFG.layerIndex;
+}
+
+/* META: nombre real de cada campo (búsqueda sin mayúsculas),
+   dominios codificados (código → etiqueta) y campos de fecha. */
+const META = { real:{}, dominios:{}, fechas:new Set() };
+
+async function cargarMetadatos(token){
+  const d = await getJson(CFG.featureLayerUrl + "?f=json&token=" + encodeURIComponent(token));
+  (d.fields || []).forEach(fl => {
+    META.real[fl.name.toLowerCase()] = fl.name;
+    if (fl.type === "esriFieldTypeDate" || fl.type === "esriFieldTypeDateOnly") META.fechas.add(fl.name);
+    if (fl.domain && fl.domain.type === "codedValue"){
+      const m = {};
+      fl.domain.codedValues.forEach(cv => m[String(cv.code)] = cv.name);
+      META.dominios[fl.name] = m;
+    }
+  });
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   HELPERS BASE
+   ═══════════════════════════════════════════════════════════════ */
+const isEmpty = v => v === null || v === undefined || v === "";
+
+function esc(s){
+  if (isEmpty(s)) return "";
+  return String(s)
+    .replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")
+    .replace(/"/g,"&quot;").replace(/'/g,"&#39;");
+}
+
+/* Fechas: las de solo-fecha de Survey123 vienen a medianoche UTC; se leen
+   en UTC para que no aparezcan corridas un día en Argentina (UTC-3). */
+function fechaFmt(v){
+  if (isEmpty(v)) return "";
+  const p = n => String(n).padStart(2,'0');
+  if (typeof v === "string" && /^\d{4}-\d{2}-\d{2}$/.test(v)){
+    const [y,m,d] = v.split("-"); return d+"/"+m+"/"+y;
+  }
+  const d = new Date(v);
+  if (isNaN(d)) return String(v);
+  const utc = d.getUTCHours()===0 && d.getUTCMinutes()===0 && d.getUTCSeconds()===0;
+  return utc ? p(d.getUTCDate())+"/"+p(d.getUTCMonth()+1)+"/"+d.getUTCFullYear()
+             : p(d.getDate())+"/"+p(d.getMonth()+1)+"/"+d.getFullYear();
+}
+
+/* Respaldo para campos sin dominio que guardan si/no en crudo */
+const SI_NO = { "si":"Sí", "sí":"Sí", "no":"No", "yes":"Sí" };
+
+/* Valor ya formateado (texto plano, sin escapar) de un campo.
+   Acepta varios nombres alternativos: usa el primero que exista en la capa. */
+let _attrs = {};
+const _faltantes = new Set();
+function v(...nombres){
+  for (const n of nombres){
+    const real = META.real[n.toLowerCase()];
+    if (!real) continue;
+    const raw = _attrs[real];
+    if (isEmpty(raw)) return "";
+    if (META.dominios[real]){
+      const k = String(raw);
+      /* select_multiple: "a,b,c" → etiquetas separadas por coma */
+      if (!(k in META.dominios[real]) && k.includes(","))
+        return k.split(",").map(x => META.dominios[real][x.trim()] ?? x.trim()).join(", ");
+      return META.dominios[real][k] ?? k;
+    }
+    if (META.fechas.has(real)) return fechaFmt(raw);
+    const s = String(raw).trim();
+    return SI_NO[s.toLowerCase()] ?? s;
+  }
+  _faltantes.add(nombres.join(" | "));
+  return "";
+}
+
+function answerCell(txt){
+  if (isEmpty(txt))
+    return "<span style='font-size:12.5px;color:#aaa;'>—</span>";
+  return "<span style='font-size:12.5px;color:#333;font-weight:600;'>"+esc(txt)+"</span>";
+}
+
+function sectionTitle(t){
+  return "<div style='font-size:13px;font-weight:700;color:#1f6f43;text-transform:uppercase;"
+       + "letter-spacing:0.4px;border-left:4px solid #f58321;padding-left:8px;margin:18px 0 8px 0;'>"
+       + t + "</div>";
+}
+
+/* ─── Pregunta ───────────────────────────────────────────────
+   label: texto fijo. respuesta: texto ya formateado.
+   extras: [[etiqueta, texto], …] — detalles debajo, solo si tienen valor.
+   Todas las filas de una pregunta comparten data-qg: la paginación
+   no las separa. */
+let _qgSeq = 0;
+function qRow(label, respuesta, extras){
+  _qgSeq++;
+  const g = " data-qg='"+_qgSeq+"'";
+  const corta = String(respuesta||"").length <= 24;
+
+  let h = "<tr"+g+">"
+    + "<td style='padding:7px 8px 7px 4px;color:#333;font-size:12.5px;line-height:1.45;"
+    + "vertical-align:top;'>" + label + "</td>"
+    + "<td style='padding:7px 4px;text-align:right;vertical-align:top;"
+    + (corta ? "white-space:nowrap;" : "width:40%;") + "'>"
+    + answerCell(respuesta) + "</td></tr>";
+
+  const det = (extras||[]).filter(e => !isEmpty(e[1]));
+  if (det.length){
+    h += "<tr"+g+"><td colspan='2' style='padding:0 4px 8px 4px;'>"
+      +  "<div style='font-size:11.5px;color:#666;line-height:1.5;"
+      +  "border-left:2px solid #eee;padding-left:8px;'>"
+      +  det.map(e => "<div><span style='color:#999;'>"+e[0]+":</span> "+esc(e[1])+"</div>").join("")
+      +  "</div></td></tr>";
+  }
+  h += "<tr"+g+"><td colspan='2' style='padding:0;'>"
+    +  "<div style='border-top:1px solid #f2f2f2;'></div></td></tr>";
+  return h;
+}
+
+const tblOpen  = "<table style='width:100%;border-collapse:collapse;'><tbody>";
+const tblClose = "</tbody></table>";
+
+/* Atajo: pregunta Sí/No con un campo "Detalle" opcional */
+const sn = (label, campo, detalle) =>
+  qRow(label, v(campo), detalle ? [["Detalle", v(detalle)]] : null);
+
+/* ═══════════════════════════════════════════════════════════════
+   ENCABEZADO INSTITUCIONAL
+   ═══════════════════════════════════════════════════════════════ */
+function headerInstitucional(logoSrc){
+  const logoCell = logoSrc
+    ? "<td style='width:1%;padding:0 14px 0 0;vertical-align:middle;'>"
+      + "<img src='"+logoSrc+"' style='height:46px;width:auto;display:block;'></td>"
+    : "";
+  return "<div style='background:"+CFG.headerBg+";border-radius:12px;padding:12px 16px;margin-bottom:10px;'>"
+       + "<table style='width:100%;border-collapse:collapse;'><tr>"
+       + logoCell
+       + "<td style='vertical-align:middle;color:#ffffff;font-size:14px;font-weight:700;line-height:1.35;'>"
+       + esc(CFG.headerTitle) + "</td>"
+       + "</tr></table></div>";
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   ADJUNTOS
+   ═══════════════════════════════════════════════════════════════ */
+function blobToDataURL(blob){
+  return new Promise((res, rej) => {
+    const fr = new FileReader();
+    fr.onload  = () => res(fr.result);
+    fr.onerror = () => rej(new Error("No se pudo leer el adjunto"));
+    fr.readAsDataURL(blob);
+  });
+}
+
+async function fetchAdjuntos(objectId, token){
+  const infoUrl = CFG.featureLayerUrl + "/" + objectId
+                + "/attachments?f=json&token=" + encodeURIComponent(token);
+  let infos = [];
+  try{
+    const r = await fetch(infoUrl);
+    const d = await r.json();
+    if (d.error || !d.attachmentInfos) return [];
+    infos = d.attachmentInfos.filter(a => (a.contentType||"").toLowerCase().startsWith("image/"));
+  } catch(e){ return []; }
+
+  infos = infos.slice(0, CFG.maxAdjuntos);
+
+  const out = [];
+  for (let i = 0; i < infos.length; i++){
+    step(`Descargando imagen ${i+1}/${infos.length}…`);
+    const a = infos[i];
+    const fileUrl = CFG.featureLayerUrl + "/" + objectId + "/attachments/" + a.id
+                  + "?token=" + encodeURIComponent(token);
+    try{
+      const fr = await fetch(fileUrl);
+      if (!fr.ok) continue;
+      const blob = await fr.blob();
+      out.push({ name: a.name || ("Imagen "+(i+1)), dataUrl: await blobToDataURL(blob) });
+    } catch(e){ /* si una falla, se saltea */ }
+  }
+  return out;
+}
+
+function bloquesAdjuntos(adjuntos){
+  if (!adjuntos.length) return [];
+  const blocks = [];
+  adjuntos.forEach((img, i) => {
+    const card =
+      "<div style='margin-top:10px;border:1px solid #eee;border-radius:10px;overflow:hidden;background:#fafafa;'>"
+      + "<div style='text-align:center;padding:8px;'>"
+      + "<img src='"+img.dataUrl+"' style='max-width:100%;max-height:235px;width:auto;height:auto;"
+      + "display:inline-block;border-radius:6px;'></div>"
+      + "<div style='font-size:11px;color:#888;padding:0 10px 8px 10px;text-align:center;"
+      + "word-break:break-all;'>"+esc(img.name)+"</div></div>";
+    blocks.push(i === 0 ? sectionTitle("Adjuntos") + card : card);
+  });
+  return blocks;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   ARMADO DE BLOQUES
+   ═══════════════════════════════════════════════════════════════ */
+function buildBlocks(f, logoSrc, imagenes){
+  _attrs = f;
+
+  const nombre   = v("apellido_nombre");
+  const dni      = v("dni");
+  const fechaReg = v("CreationDate", "created_date", "fecha");
+
+  /* ── Encabezado institucional ── */
+  const headerHSE = headerInstitucional(logoSrc);
+
+  /* ── Encabezado del registro ── */
+  const sub = [dni ? "DNI " + dni : "", v("sector"), fechaReg].filter(Boolean).join(" · ");
+  const headerRegistro =
+    "<div style='background:#1f6f43;color:#ffffff;padding:14px 18px;border-radius:10px;'>"
+    + "<div style='font-size:15px;font-weight:700;'>"+esc(nombre || "Sin nombre")+"</div>"
+    + "<div style='font-size:12px;opacity:0.85;margin-top:2px;'>"+esc(sub)+"</div></div>";
+
+  /* ── Datos personales ── */
+  const infoRow = (k,txt) =>
+    "<tr><td style='padding:4px;color:#888;vertical-align:top;'>"+k+"</td>"
+    + "<td style='padding:4px;text-align:right;font-weight:600;vertical-align:top;'>"
+    + (isEmpty(txt) ? "<span style='color:#aaa;font-weight:400;'>—</span>" : esc(txt)) + "</td></tr>";
+
+  const gDatos = sectionTitle("Datos personales")
+    + "<table style='width:100%;border-collapse:collapse;font-size:12.5px;color:#444;'><tbody>"
+    + infoRow("Apellido/s y nombre/s",                          nombre)
+    + infoRow("DNI",                                            dni)
+    + infoRow("Lugar de nacimiento",                            v("lugar_nacimiento"))
+    + infoRow("Fecha de nacimiento",                            v("fecha_nacimiento"))
+    + infoRow("Edad",                                           v("edad"))
+    + infoRow("Celular",                                        v("celular"))
+    + infoRow("Dirección",                                      v("direccion"))
+    + infoRow("Localidad",                                      v("localidad"))
+    + infoRow("Obra social / Prepaga",                          v("obra_social"))
+    + infoRow("N° de credencial y plan",                        v("n_credencial_plan"))
+    + infoRow("Sector",                                         v("sector"))
+    + infoRow("Grupo y factor sanguíneo",                       v("grupo_factor_sang"))
+    + infoRow("Teléfono de emergencia (vínculo)",               v("tel_emergencia"))
+    + "</tbody></table>";
+
+  /* ── Antecedentes personales / hábitos ── */
+  const gHabitos = sectionTitle("Antecedentes personales / hábitos")
+    + tblOpen
+    + qRow("¿Fuma tabaco?", v("fuma_tabaco"), [["Cigarrillos por día", v("cigarrillos_dia")]])
+    + qRow("¿Fumaba anteriormente?", v("fuma_antes"), [["Años que fumó", v("fuma_tabaco_anios")]])
+    + qRow("¿Consume alcohol?", v("alcohol"), [["Frecuencia", v("frecuencia")]])
+    + qRow("¿Consume drogas?", v("drogas"))
+    + qRow("¿Realiza actividad física?", v("actividad_fisica"),
+           [["Actividad", v("detalle_actividad")], ["Frecuencia", v("frecuencia_actividad")]])
+    + sn("¿Tiene alguna restricción alimentaria o dieta específica?", "restriccion_alimentaria", "detalle_alimentacion")
+    + qRow("¿Tuvo algún accidente de trabajo?", v("accidente_trabajo"),
+           [["Descripción", v("detalle_accidente")]])
+    + qRow("¿Tuvo que abandonar algún empleo por razones de salud?",
+           v("abandonar_empleo", "abandonar_empelo", "abandonar empelo"),
+           [["Detalle", v("detalle_abandonar_empleo")]])
+    + tblClose;
+
+  /* ── Tiene o ha tenido ── */
+  const gTiene = sectionTitle("Tiene o ha tenido")
+    + tblOpen
+    + sn("¿Enfermedad de los ojos, nariz, garganta u oído?", "enfermedad_ojo_nariz", "detalle_enfermedad_ojo")
+    + sn("¿Usa anteojos aéreos o lentes de contacto?", "anteojos_aereos", "detalle_anteojos_aereos")
+    + sn("¿Mareos, desmayos, convulsiones (epilepsia), dolores de cabeza frecuentes, enfermedades neurológicas?", "mareo_desmayos", "detalle_mareos")
+    + sn("¿Se encuentra actualmente en tratamiento psiquiátrico o psicológico?", "tratamiento_psiquiatrico")
+    + sn("¿Dificultad para respirar, asma, ronquera persistente, rinitis, tos, bronquitis, enfisema, tuberculosis u otra enfermedad respiratoria?", "dificultad_respiratoria", "detalle_respiratoria")
+    + sn("¿Alergia cutánea, al gluten, dermatitis atópica, alergia al sol, medicamentos, alimentos, cosméticos, picadura de insectos, plantas, metal, pelos, plumas, polen, polvillo, cambios climáticos, transpiración u otras?", "alergias", "detalle_alergias")
+    + sn("¿Enfermedades de la piel?", "enfermedad_piel", "detalle_enfermedad_piel")
+    + sn("¿Dolor de pecho, palpitaciones, hipertensión arterial, infarto, insuficiencia cardíaca, cardiopatía congénita u otra enfermedad del corazón o vasos sanguíneos?", "enfermedad_cardiaca", "detalle_cardiaca")
+    + sn("¿Tiene várices?", "varices", "detalle_varices")
+    + sn("¿Gastritis, ictericia, hemorragia intestinal, úlcera de estómago o duodeno, colitis, diverticulosis u otras enfermedades del estómago, hígado, vesícula e intestinos?", "enfermedad_gastrointestinal", "detalle_enferm_gastro")
+    + sn("¿Alteraciones/infecciones urinarias, enfermedades del riñón, cólicos, vejiga o próstata?", "alteraciones_urinarias", "detalle_alteracion_urinaria")
+    + sn("¿Diabetes, hipo o hipertiroidismo u otra enfermedad endócrina?", "enfermedad_endocrina", "detalle_enfermedad_endocrina")
+    + sn("¿Afecciones musculares, óseas, dolores de columna frecuentes, articulaciones u otras?", "afecciones_musculares", "detalle_afecciones_musculares")
+    + qRow("¿Pie plano, cavo o doloroso?", v("pie"),
+           [["¿Usa plantilla?", v("usa_plantilla")], ["Detalle", v("detalle_pie")]])
+    + sn("¿Se le hinchan o duelen frecuentemente las articulaciones?", "articulaciones", "detalle_articulaciones")
+    + sn("¿Hernias en la actualidad?", "hernias", "detalle_hernias")
+    + sn("¿Deformidades, rengueras, amputaciones?", "deformidades", "detalle_deformidades")
+    + sn("¿Anemias u otras enfermedades de la sangre?", "enfermedad_sangre", "detalle_enfermedad_sangre")
+    + sn("¿Enfermedades autoinmunes y/o tratamiento inmunosupresor?", "enfermedad_autoinmune", "detalle_enferm_autoinmune")
+    + qRow("¿Ha tenido algún cambio de peso en el último año?", v("peso"),
+           [["¿Cuánto?", v("cantidad_peso")], ["Motivo", v("detalle_peso")]])
+    + sn("¿Tiene algún miedo, fobia o pánico?", "miedo_fobia", "detalle_miedo_fobia")
+    + sn("¿Ha tenido alguna afección que haya requerido internación?", "internacion")
+    + sn("¿Está actualmente bajo observación o tratamiento médico?", "tratamiento_medico", "detalle_tratamiento_medico")
+    + sn("¿Está tomando alguna medicación?", "medicacion", "detalle_medicacion")
+    + tblClose;
+
+  /* ── Antecedentes quirúrgicos ── */
+  const gQuirurgicos = sectionTitle("Antecedentes quirúrgicos")
+    + tblOpen
+    + qRow("¿Fue intervenido quirúrgicamente por alguna causa?", v("cirugias"),
+           [["Detalle", v("detalle_cirugias")], ["Fecha", v("fecha_cirugias")]])
+    + sn("¿Padece alguna otra enfermedad o condición no especificada anteriormente?", "otra_enfermedad", "detalle_otra_enfermedad")
+    + tblClose;
+
+  /* ── Historia ginecológica: solo si hay algún dato cargado ── */
+  const camposGineco = ["menarca","menopausia","dismenorrea","ritmo_menstrual","fecha_ultima_menstruacion",
+    "embarazos","embarazos_cuantos","hijos","hijos_cuantos","partos_normales","partos_normales_cuantos",
+    "cesareas","cesareas_cuantas","complicaciones_postparto","detalle_complicaciones","abortos",
+    "ginecopatias","detalle_ginecopatias","ultimo_pap","ultimo_control_mamografico"];
+  let gGineco = "";
+  if (camposGineco.some(c => !isEmpty(v(c)))){
+    gGineco = sectionTitle("Historia ginecológica")
+      + tblOpen
+      + qRow("Menarca (años)", v("menarca"))
+      + qRow("Menopausia (años)", v("menopausia"))
+      + qRow("Dismenorrea", v("dismenorrea"))
+      + qRow("Ritmo menstrual", v("ritmo_menstrual"))
+      + qRow("Fecha de última menstruación", v("fecha_ultima_menstruacion"))
+      + qRow("Embarazos", v("embarazos"), [["¿Cuántos?", v("embarazos_cuantos")]])
+      + qRow("Hijos", v("hijos"), [["¿Cuántos?", v("hijos_cuantos")]])
+      + qRow("Partos normales", v("partos_normales"), [["¿Cuántos?", v("partos_normales_cuantos")]])
+      + qRow("Cesáreas", v("cesareas"), [["¿Cuántas?", v("cesareas_cuantas")]])
+      + qRow("Complicaciones post parto", v("complicaciones_postparto"), [["Detalle", v("detalle_complicaciones")]])
+      + qRow("Abortos", v("abortos"))
+      + qRow("Enfermedades ginecológicas", v("ginecopatias"), [["Detalle", v("detalle_ginecopatias")]])
+      + qRow("Último control citológico (PAP)", v("ultimo_pap"))
+      + qRow("Último control mamográfico / ecográfico", v("ultimo_control_mamografico"))
+      + tblClose;
+  }
+
+  /* ── Vacunación ── */
+  const gVacunas = sectionTitle("Vacunación")
+    + tblOpen
+    + sn("¿Ha recibido la vacuna contra la Hepatitis B?", "hepatitis_b")
+    + sn("¿Ha recibido la vacuna Triple Viral?", "triple_viral")
+    + sn("¿Ha recibido la vacuna Doble Bacteriana?", "doble_bacteriana")
+    + sn("¿Ha recibido la vacuna contra la Fiebre Hemorrágica Argentina?", "fiebre_hemorragica")
+    + tblClose;
+
+  /* ── Ensamblado ── */
+  const blocks = [headerHSE, headerRegistro, gDatos, gHabitos, gTiene, gQuirurgicos];
+  if (gGineco) blocks.push(gGineco);
+  blocks.push(gVacunas);
+  bloquesAdjuntos(imagenes).forEach(b => blocks.push(b));
+
+  if (_faltantes.size)
+    console.warn("Campos que no existen en la capa (revisar nombres):", Array.from(_faltantes));
+
+  return { blocks, nombre, dni };
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   PAGINACIÓN + RASTERIZADO  (igual que el informe de picamacho)
+   ═══════════════════════════════════════════════════════════════ */
+const SHELL_OPEN =
+  "<div style=\"font-family:'Segoe UI',Arial,sans-serif;background:#ffffff;"
++ "border:1px solid #eaeaea;border-radius:14px;overflow:hidden;padding:16px 18px;\">";
+const SHELL_CLOSE = "</div>";
+
+function makePageEl(){
+  const d = document.createElement("div");
+  d.style.width = STAGE_W_PX + "px";
+  d.style.background = "#fff";
+  d.innerHTML = SHELL_OPEN + SHELL_CLOSE;
+  return d;
+}
+
+function waitForImages(root){
+  const imgs = Array.from(root.querySelectorAll("img"));
+  return Promise.all(imgs.map(im =>
+    (im.complete && im.naturalWidth) ? Promise.resolve()
+      : new Promise(res => { im.onload = res; im.onerror = res; })
+  ));
+}
+
+function decompose(html){
+  const tmp = document.createElement("div");
+  tmp.innerHTML = html;
+
+  const tabla = tmp.querySelector("table");
+  if (!tabla || tabla.parentNode !== tmp) return { type:"atomic", html };
+
+  let pre = "", post = "", pasada = false;
+  Array.from(tmp.childNodes).forEach(n => {
+    if (n === tabla){ pasada = true; return; }
+    const h = (n.outerHTML !== undefined) ? n.outerHTML : (n.textContent || "");
+    if (pasada) post += h; else pre += h;
+  });
+
+  const estilo = tabla.getAttribute("style") || "";
+  const aperturaTabla = "<table" + (estilo ? " style='"+estilo+"'" : "") + "><tbody>";
+  const cierreTabla   = "</tbody></table>";
+
+  const grupos = [];
+  let actual = null, claveActual = null;
+  Array.from(tabla.querySelectorAll("tr")).forEach(tr => {
+    const k = tr.getAttribute("data-qg");
+    if (k && k === claveActual){ actual.push(tr.outerHTML); }
+    else { actual = [tr.outerHTML]; grupos.push(actual); claveActual = k; }
+  });
+
+  return { type:"table", pre, post, aperturaTabla, cierreTabla,
+           grupos: grupos.map(a => a.join("")) };
+}
+
+async function paginate(blocks){
+  const stage = $("stage");
+  stage.innerHTML = "";
+
+  const warm = document.createElement("div");
+  warm.style.width = STAGE_W_PX + "px";
+  warm.innerHTML = blocks.join("");
+  stage.appendChild(warm);
+  await waitForImages(warm);
+  stage.removeChild(warm);
+
+  const pages = [];
+  let pageEl = makePageEl();
+  stage.appendChild(pageEl);
+  let inner = pageEl.firstElementChild;
+  let count = 0;
+
+  const desborda = () => pageEl.offsetHeight > MAX_PAGE_PX;
+  const nuevaPagina = () => {
+    pages.push(pageEl);
+    pageEl = makePageEl();
+    stage.appendChild(pageEl);
+    inner = pageEl.firstElementChild;
+    count = 0;
+  };
+
+  for (const b of blocks){
+    const d = decompose(b);
+
+    if (d.type === "atomic"){
+      const holder = document.createElement("div");
+      holder.innerHTML = d.html;
+      inner.appendChild(holder);
+      await waitForImages(holder);
+
+      if (desborda() && count > 0){
+        inner.removeChild(holder);
+        nuevaPagina();
+        inner.appendChild(holder);
+      }
+      count++;
+      continue;
+    }
+
+    let holder = null, tbody = null;
+
+    const abrirTrozo = incluyeTitulo => {
+      holder = document.createElement("div");
+      holder.innerHTML = (incluyeTitulo ? d.pre : "") + d.aperturaTabla + d.cierreTabla;
+      if (incluyeTitulo && count > 0) holder.style.marginTop = "14px";
+      inner.appendChild(holder);
+      tbody = holder.querySelector("tbody");
+    };
+
+    abrirTrozo(true);
+    if (desborda() && count > 0){
+      inner.removeChild(holder);
+      nuevaPagina();
+      abrirTrozo(true);
+    }
+    count++;
+
+    for (const g of d.grupos){
+      const antes = tbody.children.length;
+      tbody.insertAdjacentHTML("beforeend", g);
+
+      if (desborda()){
+        while (tbody.children.length > antes) tbody.removeChild(tbody.lastChild);
+
+        if (antes === 0){
+          const teniaTitulo = d.pre !== "" && holder.innerHTML.indexOf(d.pre) === 0;
+          inner.removeChild(holder);
+          if (count > 1) nuevaPagina();
+          abrirTrozo(teniaTitulo);
+        } else {
+          nuevaPagina();
+          abrirTrozo(false);
+        }
+        count = 1;
+        tbody.insertAdjacentHTML("beforeend", g);
+      }
+    }
+
+    if (d.post){
+      const cola = document.createElement("div");
+      cola.innerHTML = d.post;
+      inner.appendChild(cola);
+      if (desborda() && count > 0){
+        inner.removeChild(cola);
+        nuevaPagina();
+        inner.appendChild(cola);
+      }
+      count++;
+    }
+  }
+
+  pages.push(pageEl);
+  return pages;
+}
+
+async function renderPdf(pages, filename){
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({ orientation:"portrait", unit:"mm", format:"a4" });
+
+  for (let i = 0; i < pages.length; i++){
+    step(`Renderizando página ${i+1}/${pages.length}…`);
+    prog(75 + (i / pages.length) * 22);
+
+    const canvas = await html2canvas(pages[i], {
+      scale: 2, backgroundColor: "#ffffff", logging: false, useCORS: true, allowTaint: false
+    });
+
+    const imgH_mm = (canvas.height / canvas.width) * CONTENT_W_MM;
+
+    if (i > 0) doc.addPage();
+    doc.addImage(canvas.toDataURL("image/jpeg", 0.94), "JPEG",
+                 MARGIN_MM, MARGIN_MM, CONTENT_W_MM, imgH_mm);
+
+    doc.setFont("helvetica","normal");
+    doc.setFontSize(7.5);
+    doc.setTextColor(150,150,150);
+    doc.text(`Página ${i+1} de ${pages.length}`, PAGE_W_MM - MARGIN_MM, PAGE_H_MM - 6, {align:"right"});
+  }
+  doc.save(filename);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   LOGO
+   ═══════════════════════════════════════════════════════════════ */
+async function resolverLogo(){
+  if (!CFG.logoUrl) return null;
+  try{
+    const r = await fetch(CFG.logoUrl, { mode: "cors" });
+    if (!r.ok) throw new Error();
+    return await blobToDataURL(await r.blob());
+  } catch(e){
+    return CFG.logoUrl;
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   FLUJO PRINCIPAL
+   ═══════════════════════════════════════════════════════════════ */
+async function run(){
+  const p = new URLSearchParams(location.search);
+  let objectId = p.get("objectId") || p.get("objectid") || sessionStorage.getItem("pending_oid");
+  if (!objectId){ fail("No se recibió el objectId en la URL.\n\nEjemplo: ?objectId=42"); return; }
+
+  let token = getToken();
+  if (!token && location.hash.includes("access_token")){
+    const h = new URLSearchParams(location.hash.replace(/^#/,""));
+    const tk = h.get("access_token");
+    if (tk){
+      saveToken(tk, parseInt(h.get("expires_in")||"3600",10));
+      token = tk;
+      history.replaceState(null,"",location.pathname+"?objectId="+objectId);
+      sessionStorage.removeItem("pending_oid");
+    }
+  }
+  if (!token){
+    $("sp").className = "sp auth";
+    title("Autenticando…","Redirigiendo al portal de ArcGIS.");
+    prog(5); step("Sin sesión — iniciando OAuth…");
+    await sleep(900); doLogin(); return;
+  }
+
+  try{
+    title("Obteniendo datos…","Consultando la capa de declaraciones juradas.");
+    prog(10); step("Resolviendo capa…");
+    CFG.featureLayerUrl = await resolverUrlCapa(token);
+
+    prog(15); step("Leyendo estructura de la capa…");
+    await cargarMetadatos(token);
+
+    prog(20); step("Consultando registro…");
+    const data = await getJson(CFG.featureLayerUrl + "/query?" + new URLSearchParams({
+      objectIds: objectId, outFields: "*", returnGeometry: "false", f: "json", token
+    }));
+    if (!data.features || !data.features.length)
+      throw new Error(`No se encontró ningún registro con objectId = ${objectId}.`);
+
+    const f = data.features[0].attributes;
+
+    prog(28); step("Cargando logo…");
+    const logoSrc = await resolverLogo();
+
+    let imagenes = [];
+    if (CFG.incluirAdjuntos){
+      prog(35); step("Buscando imágenes adjuntas…");
+      imagenes = await fetchAdjuntos(objectId, token);
+    }
+
+    title("Generando informe…","Componiendo el documento.");
+    prog(55); step("Armando secciones…");
+    await sleep(100);
+
+    const { blocks, nombre, dni } = buildBlocks(f, logoSrc, imagenes);
+
+    prog(65); step("Calculando paginación…");
+    const pages = await paginate(blocks);
+
+    const safe = s => String(s||"")
+      .replace(/[^\wáéíóúÁÉÍÓÚñÑ\- ]/g,"").trim().replace(/\s+/g,"_");
+    const filename = `HSE_DDJJ_Salud_${safe(nombre)||"registro"}${dni ? "_"+safe(dni) : ""}.pdf`;
+
+    await renderPdf(pages, filename);
+
+    $("stage").innerHTML = "";
+    done();
+
+  } catch(err){
+    fail(err.message);
+  }
+}
+
+run();
+</script>
+</body>
+</html>
